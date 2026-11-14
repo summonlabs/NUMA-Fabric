@@ -182,10 +182,11 @@ std::uint64_t Runtime::reserved_bytes() const { return reservations_.total_reser
 bool Runtime::reservations_clean() const { return reservations_.accounting_clean(); }
 std::uint64_t Runtime::node_reserved(NumaNodeId id) const { return reservations_.node_reserved_memory(id); }
 
-affinity::Worker Runtime::register_worker(WorkerId id, ProcessId pid) { return registry_.register_worker(id, pid); }
-affinity::Worker Runtime::restart_worker(WorkerId id, ProcessId pid) { return registry_.restart_worker(id, pid); }
+affinity::Worker Runtime::register_worker(WorkerId id, ProcessId pid) { return registry_.register_worker(id, pid, epoch()); }
+affinity::Worker Runtime::restart_worker(WorkerId id, ProcessId pid) { return registry_.restart_worker(id, pid, epoch()); }
 void Runtime::mark_worker_dead(WorkerId id, WorkerBootId boot) { registry_.mark_dead(id, boot); }
 const affinity::Worker* Runtime::worker(WorkerId id) const { return registry_.find(id); }
+std::optional<affinity::Worker> Runtime::worker_snapshot(WorkerId id) const { return registry_.snapshot(id); }
 std::vector<affinity::Worker> Runtime::workers() const { return registry_.all(); }
 
 Runtime::BindResult Runtime::bind_worker(WorkerId id, WorkerBootId boot, NumaNodeId node, bool apply_affinity) {
@@ -197,19 +198,19 @@ Runtime::BindResult Runtime::bind_worker(WorkerId id, WorkerBootId boot, NumaNod
         if (p.node == node) set.add_processor(p.group, p.index_in_group.value());
     }
     bool applied = false;
-    if (apply_affinity) applied = backend_->apply_thread_affinity(set);
-    auto* w = registry_.find_mut(id);
+    affinity::AffinitySet original;
+    if (apply_affinity) {
+        original = backend_->current_thread_affinity();
+        applied = backend_->apply_thread_affinity(set);
+    }
     BindResult r;
     r.binding_id = BindingId::from(next_placement_);
-    r.generation = BindingGeneration::from(w ? w->binding_generation.next().value() : 1);
     r.applied = applied;
-    if (w) {
-        w->binding_id = r.binding_id;
-        w->binding_generation = r.generation;
-        w->node = node;
-        w->bound = true;
-        w->requested_affinity = set;
-        w->current_affinity = set;
+    // The incarnation is re-checked when the binding is recorded: one superseded meanwhile
+    // (worker restarted) must not have its binding land on the new incarnation.
+    if (!registry_.commit_binding(id, boot, r.binding_id, node, set, r.generation)) {
+        if (applied) backend_->apply_thread_affinity(original);
+        throw RuntimeError("stale worker boot for binding " + id.to_string());
     }
     return r;
 }
@@ -372,6 +373,9 @@ void Runtime::recover(const std::string& path) {
         w.binding_generation = pw.binding_generation;
         w.policy_generation = pw.policy_generation;
         w.last_observation_generation = ObservationGeneration::from(pw.live_generation);
+        // A recovered incarnation is not live: its boot carries no authority in this process
+        // until the worker registers again (and is issued a fresh boot).
+        w.alive = false;
         registry_.restore(w);
     }
     for (const auto& pr : state.reservations) {

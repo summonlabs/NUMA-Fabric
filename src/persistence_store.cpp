@@ -9,6 +9,7 @@
 #include <cstring>
 #include <fstream>
 #include <limits>
+#include <set>
 
 #include <windows.h>
 
@@ -149,13 +150,23 @@ PersistedState deserialize(const std::vector<std::uint8_t>& data) {
     s.host_generation = r.u64();
     s.policy_generation = r.u64();
 
+    // Worker and reservation ids are unique: recovery restores both by id, and a duplicate
+    // would silently replace another record (or fail midway through restoring).
+    std::set<std::uint64_t> seen;
     const auto wc = r.u32();
     if (wc > kMaxPersistedRecords) throw PersistenceError("impossible worker count");
-    for (std::uint32_t i = 0; i < wc; ++i) s.workers.push_back(read_worker(r));
+    for (std::uint32_t i = 0; i < wc; ++i) {
+        s.workers.push_back(read_worker(r));
+        if (!seen.insert(s.workers.back().id.value()).second) throw PersistenceError("duplicate worker id");
+    }
 
+    seen.clear();
     const auto rc = r.u32();
     if (rc > kMaxPersistedRecords) throw PersistenceError("impossible reservation count");
-    for (std::uint32_t i = 0; i < rc; ++i) s.reservations.push_back(read_res(r));
+    for (std::uint32_t i = 0; i < rc; ++i) {
+        s.reservations.push_back(read_res(r));
+        if (!seen.insert(s.reservations.back().id.value()).second) throw PersistenceError("duplicate reservation id");
+    }
 
     const auto pc = r.u32();
     if (pc > kMaxPersistedRecords) throw PersistenceError("impossible placement count");

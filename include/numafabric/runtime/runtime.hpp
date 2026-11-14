@@ -113,6 +113,8 @@ public:
     affinity::Worker restart_worker(WorkerId id, ProcessId pid);
     void mark_worker_dead(WorkerId id, WorkerBootId boot);
     const affinity::Worker* worker(WorkerId id) const;
+    // A consistent copy of a worker record (taken under the registry lock).
+    std::optional<affinity::Worker> worker_snapshot(WorkerId id) const;
     std::vector<affinity::Worker> workers() const;
 
     struct BindResult {
@@ -135,7 +137,7 @@ public:
 
     // ---- authority --------------------------------------------------------
     void advance_epoch();
-    CoordinatorEpoch epoch() const { return epoch_; }
+    CoordinatorEpoch epoch() const { std::lock_guard<std::mutex> lk(mutex_); return epoch_; }
     std::uint64_t policy_generation() const { return policy_generation_; }
     void advance_policy_generation();
 

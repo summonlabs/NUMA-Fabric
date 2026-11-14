@@ -19,8 +19,10 @@ Reservation ReservationStore::reserve(const ReserveRequest& req) {
     const auto gen = watermark_.next();
     watermark_ = gen;
 
+    // Read with find(): operator[] would leave a zero entry behind when the request is refused.
     if (!req.bytes.is_zero()) {
-        const auto already = node_mem_[req.node];
+        const auto mit = node_mem_.find(req.node);
+        const auto already = mit == node_mem_.end() ? 0 : mit->second;
         const auto want = already + req.bytes.value();
         if (node_capacity_) {
             const auto cap = node_capacity_(req.node).value();
@@ -30,7 +32,8 @@ Reservation ReservationStore::reserve(const ReserveRequest& req) {
         }
     }
     if (req.accelerator_capacity && req.accelerator.is_valid()) {
-        const auto already = accel_mem_[req.accelerator];
+        const auto ait = accel_mem_.find(req.accelerator);
+        const auto already = ait == accel_mem_.end() ? 0 : ait->second;
         constexpr std::uint64_t kAccelCeiling = 64ULL * 1024 * 1024 * 1024;
         if (already + req.bytes.value() > kAccelCeiling)
             throw ReservationError("accelerator-local capacity ceiling exceeded");
@@ -95,10 +98,14 @@ bool ReservationStore::restore(const Reservation& r) {
     if (!r.id.is_valid()) throw ReservationError("cannot restore invalid reservation id");
     std::lock_guard<std::mutex> lk(mutex_);
     if (reservations_.count(r.id)) throw ReservationError("duplicate reservation id on restore " + r.id.to_string());
+    // Ids issued after recovery must not collide with recovered ones.
+    if (r.id.value() >= next_id_) next_id_ = r.id.value() + 1;
     if (!r.active) { reservations_[r.id] = r; return true; }
     if (!r.bytes.is_zero() && node_capacity_) {
         const auto cap = node_capacity_(r.node).value();
-        if (cap != 0 && node_mem_[r.node] + r.bytes.value() > cap) return false; // capacity gone
+        const auto mit = node_mem_.find(r.node);
+        const auto used = mit == node_mem_.end() ? 0 : mit->second;
+        if (cap != 0 && used + r.bytes.value() > cap) return false; // capacity gone
     }
     if (!r.bytes.is_zero()) node_mem_[r.node] += r.bytes.value();
     if (r.cpu_slots > 0) node_slots_[r.node] += r.cpu_slots;

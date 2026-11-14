@@ -65,8 +65,9 @@ int main() {
     {
         persist::PersistedState st;
         persist::PersistedWorker pw;
-        pw.id = WorkerId::from(1); pw.boot = WorkerBootId::from(1); pw.alive = true;
-        for (int i = 0; i < 64; ++i) st.workers.push_back(pw);
+        pw.boot = WorkerBootId::from(1); pw.alive = true;
+        // Distinct worker ids: a persisted state holds one record per worker.
+        for (std::uint64_t i = 0; i < 64; ++i) { pw.id = WorkerId::from(i + 1); st.workers.push_back(pw); }
         std::vector<std::uint8_t> blob;
         const auto t0 = Clock::now_ns();
         for (std::uint64_t i = 0; i < N; ++i) { blob = persist::serialize(st); }

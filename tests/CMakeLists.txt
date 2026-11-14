@@ -14,6 +14,8 @@ nf_add_test(protocol      test_protocol.cpp)
 nf_add_test(synthetic     test_synthetic.cpp)
 nf_add_test(property      test_property.cpp)
 nf_add_test(concurrency   test_concurrency.cpp)
+nf_add_test(regression    test_regression.cpp)
+nf_add_test(shutdown      test_shutdown.cpp)
 
 if(NUMAFABRIC_ENABLE_CUDA)
     add_executable(test_cuda test_cuda.cpp)

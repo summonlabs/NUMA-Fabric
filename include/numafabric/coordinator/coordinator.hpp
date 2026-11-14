@@ -70,12 +70,14 @@ private:
     std::thread accept_thread_;
     std::vector<std::thread> conn_threads_;
     std::atomic<bool> running_{false};
+    std::atomic<bool> bound_{false};   // a listener is bound and not yet shut down
     std::atomic<std::uint64_t> next_conn_{1};
     std::uint16_t port_ = 0;
     std::uintptr_t listen_socket_ = 0;
 
     mutable std::mutex conn_mutex_;
     std::map<std::uint64_t, ConnState> conns_;
+    std::map<std::uint64_t, std::uintptr_t> sockets_;   // open client sockets (conn_mutex_)
 
     bool validate_authority(WorkerId id, WorkerBootId boot, AuthorityVerification& out) const;
     std::vector<std::uint8_t> reply(std::uint16_t type, protocol::WireWriter& payload) const;

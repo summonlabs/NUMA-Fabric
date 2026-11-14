@@ -9,7 +9,7 @@
 namespace numafabric {
 namespace affinity {
 
-Worker WorkerRegistry::register_worker(WorkerId id, ProcessId pid) {
+Worker WorkerRegistry::register_worker(WorkerId id, ProcessId pid, CoordinatorEpoch epoch) {
     if (!id.is_valid()) throw WorkerError("register_worker requires a valid worker id");
     std::lock_guard<std::mutex> lk(mutex_);
     if (workers_.count(id)) throw WorkerError("worker already registered: " + id.to_string());
@@ -25,11 +25,12 @@ Worker WorkerRegistry::register_worker(WorkerId id, ProcessId pid) {
     w.binding_generation = BindingGeneration::initial();
     w.policy_generation = PolicyGeneration::initial();
     w.last_observation_generation = ObservationGeneration::initial();
+    w.registered_epoch = epoch;
     workers_[id] = w;
     return w;
 }
 
-Worker WorkerRegistry::restart_worker(WorkerId id, ProcessId pid) {
+Worker WorkerRegistry::restart_worker(WorkerId id, ProcessId pid, CoordinatorEpoch epoch) {
     if (!id.is_valid()) throw WorkerError("restart_worker requires a valid worker id");
     std::lock_guard<std::mutex> lk(mutex_);
     auto it = workers_.find(id);
@@ -55,6 +56,7 @@ Worker WorkerRegistry::restart_worker(WorkerId id, ProcessId pid) {
     w.policy_id = PolicyId::invalid();
     w.policy_generation = PolicyGeneration::initial();
     w.last_observation_generation = ObservationGeneration::initial();
+    w.registered_epoch = epoch;
     return w;
 }
 
@@ -85,6 +87,29 @@ Worker* WorkerRegistry::find_mut(WorkerId id) {
     std::lock_guard<std::mutex> lk(mutex_);
     auto it = workers_.find(id);
     return it == workers_.end() ? nullptr : &it->second;
+}
+
+std::optional<Worker> WorkerRegistry::snapshot(WorkerId id) const {
+    std::lock_guard<std::mutex> lk(mutex_);
+    auto it = workers_.find(id);
+    if (it == workers_.end()) return std::nullopt;
+    return it->second;
+}
+
+bool WorkerRegistry::commit_binding(WorkerId id, WorkerBootId boot, BindingId binding, NumaNodeId node,
+                                    const AffinitySet& set, BindingGeneration& generation) {
+    std::lock_guard<std::mutex> lk(mutex_);
+    auto it = workers_.find(id);
+    if (it == workers_.end() || !it->second.alive || it->second.boot_id != boot) return false;
+    Worker& w = it->second;
+    generation = w.binding_generation.next();
+    w.binding_id = binding;
+    w.binding_generation = generation;
+    w.node = node;
+    w.bound = true;
+    w.requested_affinity = set;
+    w.current_affinity = set;
+    return true;
 }
 
 bool WorkerRegistry::validate_boot(WorkerId id, WorkerBootId claimed_boot) const {

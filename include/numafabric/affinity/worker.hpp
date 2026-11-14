@@ -51,6 +51,8 @@ struct Worker {
     bool alive = true;
     ObservationGeneration last_observation_generation = ObservationGeneration::initial();
     std::uint64_t registered_ms = 0;
+    // Coordinator epoch this incarnation registered under; its authority ends with that epoch.
+    CoordinatorEpoch registered_epoch = CoordinatorEpoch::invalid();
 };
 
 // ---------------------------------------------------------------------------
@@ -59,12 +61,14 @@ struct Worker {
 class WorkerRegistry {
 public:
     // Register a worker (first incarnation). Returns the freshly issued boot id.
-    Worker register_worker(WorkerId id, ProcessId pid);
+    Worker register_worker(WorkerId id, ProcessId pid,
+                           CoordinatorEpoch epoch = CoordinatorEpoch::invalid());
 
     // Restart the SAME logical worker with a fresh boot id. The previous
     // incarnation is invalidated; worker-specific generations are scoped to the
     // new incarnation (older generation numbers never fence the new worker).
-    Worker restart_worker(WorkerId id, ProcessId pid);
+    Worker restart_worker(WorkerId id, ProcessId pid,
+                          CoordinatorEpoch epoch = CoordinatorEpoch::invalid());
 
     void mark_dead(WorkerId id, WorkerBootId boot);
 
@@ -74,6 +78,13 @@ public:
 
     const Worker* find(WorkerId id) const;
     Worker* find_mut(WorkerId id);
+    // A consistent copy of the worker's current record, taken under the registry lock.
+    std::optional<Worker> snapshot(WorkerId id) const;
+
+    // Record a binding for incarnation `boot`, checking under the same lock that it is still
+    // the current live incarnation. Returns false (and changes nothing) when it is not.
+    bool commit_binding(WorkerId id, WorkerBootId boot, BindingId binding, NumaNodeId node,
+                        const AffinitySet& set, BindingGeneration& generation);
 
     // Validate that a mutable operation's claimed boot id is the current
     // incarnation; otherwise the authority is stale.

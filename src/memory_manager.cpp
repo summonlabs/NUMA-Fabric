@@ -124,6 +124,11 @@ void MemoryManager::release(MemoryRegionId id, std::optional<MemoryGeneration> e
         if (r.is_released()) {
             throw InvalidTransitionError("double release of region " + id.to_string());
         }
+        // A migration in flight owns the region's buffers: releasing now would free the
+        // original buffer under it (which the migration frees again on commit).
+        if (r.state == LifecycleState::Migrating) {
+            throw InvalidTransitionError("release refused while region " + id.to_string() + " is migrating");
+        }
         if (!can_transition(r.state, LifecycleState::Released) &&
             !can_transition(r.state, LifecycleState::Invalidated)) {
             throw InvalidTransitionError("release not permitted from state " +
@@ -273,34 +278,39 @@ MemoryManager::MigrationView MemoryManager::governed_reallocate(MemoryRegionId i
         return out;
     }
 
-    // Commit: advance generation, fence the old placement, free the old buffer.
-    {
-        std::lock_guard<std::mutex> bk(backend_call_mutex_);
-        backend_.free(snapshot.backend_result);
-    }
+    // Commit: advance generation, fence the old placement, then free the old buffer. The
+    // commit happens only if the region is still the one being migrated; otherwise the
+    // provisional buffer is freed instead and the region is left as it is.
+    bool committed = false;
     {
         std::lock_guard<std::mutex> lk(mutex_);
         auto it = regions_.find(id);
-        if (it == regions_.end()) return out;
-        auto& r = it->second;
-        // move accounting from old node to new node
-        const auto old_node = choose_observed_node(snapshot);
-        if (old_node.is_valid()) sub_node_usage(old_node, r.granted_bytes.value(), false);
-        r.backend_result = new_res;
-        r.actual_node = new_res.observed_node;
-        r.intended_node = target;
-        r.locality_known = new_res.locality_known;
-        r.locality_verified = false;
-        r.locality_current = true;
-        r.generation = r.generation.next();
-        r.state = LifecycleState::Rebound;
-        r.updated_ms = Clock::now_ns();
-        const auto new_node = choose_observed_node(r);
-        if (new_node.is_valid()) add_node_usage(new_node, r.granted_bytes.value());
-        out.committed = true;
-        out.copy_succeeded = true;
-        out.new_node = new_res.observed_node.is_valid() ? new_res.observed_node : target;
-        out.generation = r.generation;
+        if (it != regions_.end() && it->second.state == LifecycleState::Migrating) {
+            auto& r = it->second;
+            // move accounting from old node to new node
+            const auto old_node = choose_observed_node(snapshot);
+            if (old_node.is_valid()) sub_node_usage(old_node, r.granted_bytes.value(), false);
+            r.backend_result = new_res;
+            r.actual_node = new_res.observed_node;
+            r.intended_node = target;
+            r.locality_known = new_res.locality_known;
+            r.locality_verified = false;
+            r.locality_current = true;
+            r.generation = r.generation.next();
+            r.state = LifecycleState::Rebound;
+            r.updated_ms = Clock::now_ns();
+            const auto new_node = choose_observed_node(r);
+            if (new_node.is_valid()) add_node_usage(new_node, r.granted_bytes.value());
+            out.committed = true;
+            out.copy_succeeded = true;
+            out.new_node = new_res.observed_node.is_valid() ? new_res.observed_node : target;
+            out.generation = r.generation;
+            committed = true;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> bk(backend_call_mutex_);
+        backend_.free(committed ? snapshot.backend_result : new_res);
     }
     return out;
 }

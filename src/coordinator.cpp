@@ -60,13 +60,14 @@ std::uint16_t Coordinator::bind(std::uint16_t requested_port) {
     port_ = ntohs(local.sin_port);
     listen_socket_ = static_cast<std::uintptr_t>(listen_sock);
     running_.store(true);
+    bound_.store(true);
 
     accept_thread_ = std::thread([this] {
         while (running_.load()) {
             SOCKET cl = ::accept(static_cast<SOCKET>(listen_socket_), nullptr, nullptr);
             if (cl == INVALID_SOCKET) { if (!running_.load()) break; continue; }
             const auto conn_id = next_conn_.fetch_add(1) + 1;
-            { std::lock_guard<std::mutex> lk(conn_mutex_); conns_[conn_id] = ConnState{}; }
+            { std::lock_guard<std::mutex> lk(conn_mutex_); conns_[conn_id] = ConnState{}; sockets_[conn_id] = static_cast<std::uintptr_t>(cl); }
             conn_threads_.emplace_back([this, cl, conn_id] {
                 FrameStreamDecoder decoder;
                 bool lost = false;
@@ -96,6 +97,7 @@ std::uint16_t Coordinator::bind(std::uint16_t requested_port) {
                         if (lost) break;
                     }
                 }
+                { std::lock_guard<std::mutex> lk(conn_mutex_); sockets_.erase(conn_id); }
                 ::closesocket(cl);
                 if (lost) {
                     ConnState st;
@@ -111,13 +113,26 @@ std::uint16_t Coordinator::bind(std::uint16_t requested_port) {
 }
 
 void Coordinator::shutdown() {
-    if (!running_.exchange(false)) return;
+    running_.store(false);
+    // Idempotent, and complete even after a Shutdown frame already cleared running_.
+    if (!bound_.exchange(false)) return;
     if (listen_socket_) {
         ::shutdown(static_cast<SOCKET>(listen_socket_), SD_BOTH);
         ::closesocket(static_cast<SOCKET>(listen_socket_));
         listen_socket_ = 0;
     }
     if (accept_thread_.joinable()) accept_thread_.join();
+    // Wake every connection thread: a client that stays connected must not keep the
+    // coordinator from stopping (shutdown() stops further receives, CancelIoEx ends a blocked one;
+    // each thread still closes its own socket).
+    {
+        std::lock_guard<std::mutex> lk(conn_mutex_);
+        for (const auto& [id, sock] : sockets_) {
+            (void)id;
+            ::shutdown(static_cast<SOCKET>(sock), SD_BOTH);
+            ::CancelIoEx(reinterpret_cast<HANDLE>(sock), nullptr);
+        }
+    }
     for (auto& t : conn_threads_) { if (t.joinable()) t.join(); }
     conn_threads_.clear();
     WSACleanup();
@@ -134,9 +149,12 @@ void Coordinator::close_controller(std::uint64_t id) {
 }
 
 bool Coordinator::validate_authority(WorkerId id, WorkerBootId boot, AuthorityVerification& out) const {
-    const auto* w = runtime_.worker(id);
+    const auto w = runtime_.worker_snapshot(id);
     if (!w || !w->alive) { out = AuthorityVerification::StaleBoot; return false; }
     if (w->boot_id != boot) { out = AuthorityVerification::StaleBoot; return false; }
+    // Worker authority is scoped to the epoch it registered under: after the epoch advances
+    // the worker registers again, which also fences messages that carry no epoch field.
+    if (w->registered_epoch != runtime_.epoch()) { out = AuthorityVerification::StaleEpoch; return false; }
     out = AuthorityVerification::Accepted;
     return true;
 }
@@ -264,6 +282,11 @@ std::vector<std::uint8_t> Coordinator::handle_frame(std::uint64_t conn_id, const
                 const auto res_id = ReservationId::from(r.u64());
                 AuthorityVerification av;
                 if (!validate_authority(worker_id, boot, av)) return error_reply("stale release authority", av);
+                // Only the reserving worker releases a reservation (recovered reservations carry
+                // no owner and remain releasable).
+                const auto* held = runtime_.reservations().get(res_id);
+                if (held && held->worker.is_valid() && held->worker != worker_id)
+                    return error_reply("reservation held by another worker", AuthorityVerification::StaleReservation);
                 runtime_.release_reservation(res_id);
                 WireWriter out; out.u8(1);
                 return reply(static_cast<std::uint16_t>(MsgType::ReleaseReply), out);
